@@ -1,0 +1,33 @@
+# Enclave server: needs a secret, rings the KMS client's doorbell to get it.
+cvm-version: 0.10.7
+cpus: 2
+memory: 2048
+
+networks:
+  web:
+    egress: open
+
+containers:
+  - name: "enclave-server"
+    image: "ghcr.io/example-org/doorbell-enclave-server@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    restart: always
+    networks: [web]
+    env:
+      # Where to ring.
+      - KMS_URL: "https://doorbell-kms-client.tinfoil.containers.tinfoil.dev"
+      # This enclave's own public hostname, sent in the ring so the KMS
+      # client knows where to attest and deliver. Injected by the platform.
+      - DOMAIN
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8089/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 5m
+
+shim:
+  listen-port: 443
+  upstream-port: 8089
+  paths:
+    - /health
+    - /secrets
+    - /status

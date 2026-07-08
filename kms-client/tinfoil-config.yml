@@ -1,0 +1,34 @@
+# KMS client enclave: holds the secret, answers doorbell rings.
+#
+# Note the open egress: the KMS client must be able to dial OUT to the
+# enclave server to attest it and deliver the secret.
+cvm-version: 0.10.7
+cpus: 2
+memory: 2048
+
+networks:
+  web:
+    egress: open
+
+containers:
+  - name: "kms-client"
+    image: "ghcr.io/example-org/doorbell-kms-client@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    restart: always
+    networks: [web]
+    env:
+      # The trust decision: only enclaves proven (via remote attestation) to
+      # run code released from this GitHub repo will receive the secret.
+      - ENCLAVE_REPO: "example-org/doorbell-enclave-server"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8089/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 5m
+
+shim:
+  listen-port: 443
+  upstream-port: 8089
+  paths:
+    - /health
+    - /secret_info
+    - /ring
