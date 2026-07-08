@@ -1,3 +1,5 @@
 kms-client/kms-client
+kms-client/doorbell-kms-client
 enclave-server/enclave-server
+enclave-server/doorbell-enclave-server
 .DS_Store
