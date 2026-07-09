@@ -1,33 +1,38 @@
-# The Doorbell Pattern: Attested Secret Delivery Between Enclaves
+# The Doorbell Pattern: Attested Secret Delivery to Enclaves
 
-A minimal blueprint for delivering secrets to enclaves using the **doorbell
-pattern**: an enclave that needs a secret "rings a doorbell", and the secret
-holder — after verifying the enclave via remote attestation — pushes the
-secret to it over an attested TLS channel.
+A minimal blueprint for delivering secrets into enclaves using the
+**doorbell pattern**: an enclave that needs secrets "rings a doorbell", and
+a trusted KMS client — after verifying the enclave via remote attestation —
+pushes the secrets into it over an attested TLS channel.
 
 This repo contains exactly two services and nothing else. It exists to
 exemplify the pattern in isolation.
 
 ## The Problem
 
-An enclave server boots with no secrets. It needs key material (API keys,
-encryption keys, credentials) but:
+An enclave workload boots with no secrets. It needs API keys, credentials,
+key material — but:
 
-- Baking secrets into the image would expose them to anyone with the image
-  and would show up in the attested measurement.
+- Baking secrets into the image would expose them to anyone with the image.
 - Letting the enclave *pull* secrets would require the secret holder to
   authenticate the caller — and any credential the enclave presents had to
   come from somewhere, which is the same problem recursed.
 
 ## The Doorbell Solution
 
-Invert the flow. The enclave doesn't fetch the secret; it merely announces
-where it lives. The secret holder independently verifies the destination via
-**remote attestation** and pushes the secret out.
+Invert the flow. The enclave doesn't fetch secrets; it merely announces
+where it lives. The KMS client independently verifies the destination via
+**remote attestation** and pushes the secrets out.
 
 ```
   Enclave Server                        KMS Client
-  (needs a secret)                      (holds the secret)
+  (confidential enclave,                (trusted operator-side process,
+   boots with no secrets)                runs anywhere: laptop, EC2, ...)
+        │                                     │
+        │                                     │ 0. loads secrets from its
+        │                                     │    backend (.env file here;
+        │                                     │    Secrets Manager, Vault,
+        │                                     │    etc. in production)
         │                                     │
         │  1. RING: POST /ring                │
         │     {"host": "enclave.example.dev"} │
@@ -48,7 +53,7 @@ where it lives. The secret holder independently verifies the destination via
         │     verified enclave                │
         │                                     │
         │  4. /ring response: {"delivered"}   │
-        │     (contains no secret)            │
+        │     (contains no secrets)           │
 ```
 
 ### Why this is secure
@@ -59,55 +64,58 @@ where it lives. The secret holder independently verifies the destination via
 2. **Trust comes from attestation, not credentials.** Before delivering
    anything, the KMS client verifies — cryptographically, via the hardware
    attestation of the destination enclave — that the host runs the exact
-   code published by the GitHub repo named in `ENCLAVE_REPO`. That repo name
-   is pinned in the KMS client's own configuration: the trust decision is
-   made by the secret holder at deploy time and is itself auditable.
-3. **The secret only travels over the attested channel.** It is never in
+   code published by the GitHub repo named in `ENCLAVE_REPO`. The trust
+   decision is made by the secret holder, in its own configuration.
+3. **Secrets only travel over the attested channel.** They are never in
    the `/ring` response. A malicious ringer can at worst trigger a delivery
    to a *legitimate, attested* enclave — which is harmless.
-4. **Secrets live in memory only.** Neither side persists the secret. If
-   the enclave server restarts, it simply rings again.
+4. **Secrets live in enclave memory only.** Nothing is persisted. If the
+   enclave restarts, it simply rings again.
+
+Note the trust asymmetry: the KMS client is trusted *by definition* — it
+already holds the secrets, so it doesn't need to be an enclave or prove
+anything about itself. The pattern exists to protect delivery *into* the
+enclave, whose identity must be proven.
 
 ## Components
 
-### `kms-client/` — the secret holder
+### `kms-client/` — the secret holder (not an enclave)
 
-Plays the role a KMS client would in a production system: it has the secret
-and decides who gets it.
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/health` | GET | Liveness |
-| `/ring` | POST | The doorbell. Body: `{"host": "<enclave hostname>"}`. Attests the host, then delivers the secret to its `/secrets` endpoint |
-| `/secret_info` | GET | SHA-256 fingerprint of the secret (never the secret) for verifying delivery |
-
-Environment:
-
-- `ENCLAVE_REPO` (required) — GitHub repo the enclave server must prove it
-  is running, e.g. `example-org/doorbell-enclave-server`. **This is the
-  trust decision.**
-
-The demo secret is generated randomly at boot. In a real deployment this
-would be key material from an HSM, a sealed store, or operator-provisioned
-secrets — the delivery pattern is identical.
-
-### `enclave-server/` — the secret recipient
-
-A workload that boots with no secrets and obtains one by ringing.
+A plain Go service the operator runs wherever secrets are available. Reads
+secrets from a `.env`-style file at startup; the `loadSecrets` function in
+`main.go` is the single integration point to swap in AWS Secrets Manager,
+Vault, or any other backend.
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/health` | GET | Liveness |
-| `/secrets` | POST | Receives the secret from the KMS client (arrives over the attested channel) |
-| `/status` | GET | `{"received": bool, "fingerprint": "sha256:..."}` — proof of delivery without exposure |
+| `/ring` | POST | The doorbell. Body: `{"host": "<enclave hostname>"}`. Attests the host, then delivers all secrets to its `/secrets` endpoint |
 
 Environment:
 
-- `KMS_URL` — base URL of the KMS client, e.g. `https://doorbell-kms-client.tinfoil.containers.tinfoil.dev`
+- `ENCLAVE_REPO` (required) — GitHub repo the enclave must prove it is
+  running, e.g. `example-org/doorbell-enclave-server`. **The trust decision.**
+- `SECRETS_FILE` — path to the secrets file (default `secrets.env`)
+- `PORT` — listen port (default `8080`)
+
+### `enclave-server/` — the secret recipient (the enclave)
+
+A confidential workload that boots with no secrets. On start it rings the
+KMS client once, then retries every 5 minutes until the secrets arrive,
+then stops ringing.
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/health` | GET | Liveness |
+| `/secrets` | POST | Receives the secrets from the KMS client (arrives over the attested channel) |
+| `/status` | GET | `{"received": bool, "keys": [...]}` — secret *names* only, never values |
+
+Environment:
+
+- `KMS_URL` — base URL of the KMS client (must be reachable from the
+  enclave; see "Trying it" for the alternative when it isn't)
 - `DOMAIN` — this enclave's own public hostname (injected by the platform),
   sent in the ring so the KMS client knows where to attest and deliver
-
-On boot it rings every 15 seconds until the secret arrives, then stops.
 
 ## The Core Code
 
@@ -125,8 +133,8 @@ if err != nil {
     return
 }
 
-// Deliver the secret over the attested channel — never in the /ring
-// response, so only the attested enclave ever sees it.
+// Deliver the secrets over the attested channel — never in the /ring
+// response, so only the attested enclave ever sees them.
 httpClient.Post("https://"+req.Host+"/secrets", ...)
 ```
 
@@ -136,46 +144,64 @@ against the signed release of the pinned GitHub repo, and pins the TLS
 certificate to the attested enclave — so the subsequent POST cannot be
 intercepted or redirected.
 
-## Verifying the Pattern (demo)
+## Trying It
 
-With both enclaves deployed, `demo/demo.sh` walks through four checks:
+Deploy the enclave server (see below), then run the KMS client anywhere —
+including your laptop:
 
 ```sh
-./demo/demo.sh <kms-client-host> <enclave-server-host>
+cd kms-client
+cp secrets.env.example secrets.env   # edit with your values
+ENCLAVE_REPO=your-org/doorbell-enclave-server go run .
 ```
 
-1. **Delivery happened, secret never exposed** — the fingerprint from the
-   KMS client's `/secret_info` matches the enclave server's `/status`.
-2. **Anyone can ring** — a ring from your laptop (naming the legitimate
-   enclave) succeeds. The ring is not a privileged operation.
-3. **Attestation gates delivery** — a ring naming an unattested host fails
-   with `502 attestation failed`. Nothing is delivered.
-4. **The response carries no secret** — the `/ring` response body is
-   inspected: it contains only `{"status": "delivered"}`.
+**If the KMS client is reachable from the enclave** (set `KMS_URL` in the
+enclave's config), the enclave rings on boot and secrets arrive
+automatically.
 
-## Deploying
+**If it isn't** (e.g. laptop behind NAT), ring on the enclave's behalf —
+this works because the ring is not a privileged operation:
 
-Each service directory is designed to be pushed as **its own GitHub repo**.
-This matters: attestation binds an enclave's identity to the repo that
-released its code, so the two services cannot share one repo.
+```sh
+curl -X POST localhost:8080/ring \
+  -H 'Content-Type: application/json' \
+  -d '{"host": "<enclave-hostname>"}'
+```
 
-1. Push `kms-client/` and `enclave-server/` as two repos (e.g.
-   `your-org/doorbell-kms-client`, `your-org/doorbell-enclave-server`).
-2. Replace `example-org` with your org in each `go.mod`,
-   `tinfoil-config.yml`, and set `ENCLAVE_REPO` in the KMS client's config
-   to the enclave server's repo.
-3. Run the `Tinfoil Release` workflow in each repo. It builds the image,
-   pins its digest into `tinfoil-config.yml`, measures it, and publishes a
-   signed release — the artifact that attestation verifies against.
-4. Deploy both enclaves on Tinfoil. Set `KMS_URL` on the enclave server to
-   the KMS client's deployed hostname.
+Verify delivery — names only, never values:
 
-The enclave server starts ringing on boot; within ~15 seconds of both being
-up, the secret is delivered.
+```sh
+curl https://<enclave-hostname>/status
+# {"received": true, "keys": ["API_KEY", "DATABASE_PASSWORD", "SIGNING_KEY"]}
+```
+
+To see attestation gate a delivery, ring with a host that is not the
+attested enclave and watch it fail with `502 enclave attestation failed`.
+
+## Deploying the Enclave Server
+
+Attestation binds the enclave's identity to the GitHub repo that released
+its code, so `enclave-server/` must live in its own repo:
+
+1. Push `enclave-server/` as its own GitHub repo (e.g.
+   `your-org/doorbell-enclave-server`), replacing `example-org` in
+   `go.mod` and `tinfoil-config.yml` with your org.
+2. Run the `Tinfoil Release` workflow. It builds the image, pins its digest
+   into `tinfoil-config.yml`, measures it, and publishes a signed release —
+   the artifact that attestation verifies against.
+3. Deploy the enclave on Tinfoil, setting `KMS_URL` if the KMS client is
+   reachable from it.
+4. Point the KMS client's `ENCLAVE_REPO` at that repo.
+
+The KMS client needs no release process, no container, and no attested
+identity — it is a pure Go program. Cross-compile a static binary
+(`CGO_ENABLED=0 GOOS=linux go build`) and run it anywhere, like any other
+internal service.
 
 ## What This Blueprint Deliberately Leaves Out
 
 To keep the pattern legible, this repo has **no** database, object storage,
 sidecars, multi-tenant keys, or business logic. For a fuller system built on
-the same pattern (per-user encryption keys delivered to consumer enclaves for
-MPC-style processing), see the secret-storage example this was distilled from.
+the same pattern (per-user encryption keys delivered to consumer enclaves
+for MPC-style processing), see the secret-storage example this was
+distilled from.

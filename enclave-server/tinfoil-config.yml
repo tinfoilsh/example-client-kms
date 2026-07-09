@@ -1,5 +1,5 @@
 # Enclave server: needs a secret, rings the KMS client's doorbell to get it.
-cvm-version: 0.10.7
+cvm-version: 0.10.8
 cpus: 2
 memory: 2048
 
@@ -13,8 +13,11 @@ containers:
     restart: always
     networks: [web]
     env:
-      # Where to ring.
-      - KMS_URL: "https://doorbell-kms-client.tinfoil.containers.tinfoil.dev"
+      # Where to ring: the KMS client, running wherever the operator hosts
+      # it (it is not an enclave). Must be reachable from this enclave.
+      # If it isn't (e.g. KMS client on a laptop), the operator can ring
+      # on the enclave's behalf instead — see the blueprint README.
+      - KMS_URL: "https://kms.internal.example.com"
       # This enclave's own public hostname, sent in the ring so the KMS
       # client knows where to attest and deliver. Injected by the platform.
       - DOMAIN

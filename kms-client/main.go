@@ -1,38 +1,41 @@
-// The KMS client holds secret material and delivers it to enclave servers
-// that ring its doorbell.
+// The KMS client is the secret-holding side of the doorbell pattern.
 //
-// This is the "answering" side of the doorbell pattern:
+// It is NOT an enclave. It is a trusted service run by the end user,
+// anywhere secrets are available: a laptop, an EC2 instance, a container
+// next to your secret manager. Its job:
 //
-//  1. An enclave server POSTs to /ring with nothing but its own hostname.
+//  1. Load secrets from a backend. Here that backend is a .env file — the
+//     simplest possible interface. To use AWS Secrets Manager, Vault, or
+//     anything else, replace loadSecrets; the delivery pattern is unchanged.
+//  2. Listen for doorbell rings: POST /ring {"host": "<enclave hostname>"}.
 //     The ring is unauthenticated and carries no authority — anyone can ring.
-//  2. The KMS client attests the claimed host using remote attestation,
-//     verifying that it runs the expected code from ENCLAVE_REPO.
-//  3. Only if attestation succeeds, the KMS client dials OUT to the enclave
-//     server and delivers the secret over the attested TLS channel.
+//  3. On each ring, remote-attest the claimed host, verifying it is a
+//     genuine enclave running the exact code released from the ENCLAVE_REPO
+//     GitHub repo. Only then, push the secrets to the enclave's /secrets
+//     endpoint over the attested TLS channel.
 //
-// The secret is never returned in the /ring response. Trust comes entirely
+// Secrets are never returned in the /ring response. Trust comes entirely
 // from the outbound attestation of the destination, not from any credential
 // on the inbound request.
 package main
 
 import (
+	"bufio"
 	"bytes"
-	"crypto/rand"
-	"crypto/sha256"
-	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"sort"
+	"strings"
 
 	"github.com/tinfoilsh/tinfoil-go/verifier/client"
 )
 
 type Server struct {
-	secret      []byte // the secret material to deliver (in-memory only)
-	enclaveRepo string // GitHub repo the enclave server must be running (hardcoded trust decision)
+	secrets     map[string]string // loaded from the secret backend, held in memory
+	enclaveRepo string            // GitHub repo the enclave must be running (the trust decision)
 }
 
 func main() {
@@ -41,24 +44,59 @@ func main() {
 		log.Fatal("ENCLAVE_REPO is required (e.g. your-org/doorbell-enclave-server)")
 	}
 
-	// Generate the demo secret at boot. In a real deployment this would be
-	// key material loaded from an HSM, a sealed store, or operator-provided
-	// secrets. It exists in enclave memory only.
-	secret := make([]byte, 32)
-	if _, err := rand.Read(secret); err != nil {
-		log.Fatalf("generating secret: %v", err)
+	secretsFile := os.Getenv("SECRETS_FILE")
+	if secretsFile == "" {
+		secretsFile = "secrets.env"
+	}
+	secrets, err := loadSecrets(secretsFile)
+	if err != nil {
+		log.Fatalf("loading secrets: %v", err)
+	}
+	if len(secrets) == 0 {
+		log.Fatalf("no secrets found in %s", secretsFile)
 	}
 
-	srv := &Server{secret: secret, enclaveRepo: enclaveRepo}
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
+	srv := &Server{secrets: secrets, enclaveRepo: enclaveRepo}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", srv.handleHealth)
-	mux.HandleFunc("GET /secret_info", srv.handleSecretInfo)
 	mux.HandleFunc("POST /ring", srv.handleRing)
 
-	log.Printf("kms-client listening on :8089 (secret fingerprint %s, trusting %s)",
-		fingerprint(secret), enclaveRepo)
-	log.Fatal(http.ListenAndServe(":8089", mux))
+	log.Printf("kms-client listening on :%s (%d secrets loaded: %s; trusting %s)",
+		port, len(secrets), strings.Join(keyNames(secrets), ", "), enclaveRepo)
+	log.Fatal(http.ListenAndServe(":"+port, mux))
+}
+
+// loadSecrets is the secret backend interface. This implementation reads
+// KEY=VALUE pairs from a .env-style file (blank lines and # comments are
+// ignored). Replace this function to source secrets from AWS Secrets
+// Manager, Vault, GCP Secret Manager, etc. — nothing else needs to change.
+func loadSecrets(path string) (map[string]string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	secrets := make(map[string]string)
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			return nil, fmt.Errorf("malformed line (expected KEY=VALUE): %q", line)
+		}
+		secrets[strings.TrimSpace(key)] = strings.TrimSpace(value)
+	}
+	return secrets, scanner.Err()
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
@@ -66,23 +104,15 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
-// /secret_info exposes a SHA-256 fingerprint of the secret — never the secret
-// itself — so an observer can verify end-to-end delivery by comparing it with
-// the enclave server's /status.
-func (s *Server) handleSecretInfo(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"fingerprint": fingerprint(s.secret)})
-}
-
 type ringRequest struct {
-	// Host is the enclave server's public hostname. It is a delivery hint,
-	// not a claim of identity: a malicious ringer can only trigger delivery
-	// to a host that passes attestation against ENCLAVE_REPO.
+	// Host is the enclave's public hostname. It is a delivery hint, not a
+	// claim of identity: a malicious ringer can only trigger delivery to a
+	// host that passes attestation against ENCLAVE_REPO.
 	Host string `json:"host"`
 }
 
 // /ring is the doorbell. It attests the claimed host and, on success,
-// delivers the secret to the host's /secrets endpoint over attested TLS.
+// delivers the secrets to the host's /secrets endpoint over attested TLS.
 func (s *Server) handleRing(w http.ResponseWriter, r *http.Request) {
 	var req ringRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -106,11 +136,9 @@ func (s *Server) handleRing(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Deliver the secret over the attested channel — never in the /ring
-	// response, so only the attested enclave ever sees it.
-	body, _ := json.Marshal(map[string]string{
-		"secret": base64.StdEncoding.EncodeToString(s.secret),
-	})
+	// Deliver the secrets over the attested channel — never in the /ring
+	// response, so only the attested enclave ever sees them.
+	body, _ := json.Marshal(map[string]any{"secrets": s.secrets})
 	deliverReq, _ := http.NewRequestWithContext(r.Context(),
 		http.MethodPost, "https://"+req.Host+"/secrets", bytes.NewReader(body))
 	deliverReq.Header.Set("Content-Type", "application/json")
@@ -123,16 +151,20 @@ func (s *Server) handleRing(w http.ResponseWriter, r *http.Request) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		http.Error(w, fmt.Sprintf("enclave server returned %d", resp.StatusCode), http.StatusBadGateway)
+		http.Error(w, fmt.Sprintf("enclave returned %d", resp.StatusCode), http.StatusBadGateway)
 		return
 	}
 
-	log.Printf("/ring: attested %s (%s) and delivered secret", req.Host, s.enclaveRepo)
+	log.Printf("/ring: attested %s (%s) and delivered %d secrets", req.Host, s.enclaveRepo, len(s.secrets))
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "delivered"})
 }
 
-func fingerprint(secret []byte) string {
-	sum := sha256.Sum256(secret)
-	return "sha256:" + hex.EncodeToString(sum[:])
+func keyNames(secrets map[string]string) []string {
+	names := make([]string, 0, len(secrets))
+	for k := range secrets {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	return names
 }
