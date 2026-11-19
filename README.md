@@ -83,15 +83,14 @@ The entire pattern is one handler in `kms-client/main.go`:
 ```go
 // Remote attestation: verify req.Host runs the exact code released from
 // ENCLAVE_REPO; get an HTTP client pinned to the attested enclave.
-sc := client.NewSecureClient(req.Host, s.enclaveRepo)
-httpClient, err := sc.HTTPClient()
+httpClient, err := tinfoil.NewEnclaveHTTPClient(r.Context(), req.Host, tinfoil.Pin{Repo: s.enclaveRepo}, nil)
 if err != nil { /* 502 — nothing delivered */ }
 
 // Deliver over the attested channel, never in the /ring response.
 httpClient.Post("https://"+req.Host+"/secrets", ...)
 ```
 
-`SecureClient` is from [`tinfoil-go`](https://github.com/tinfoilsh/tinfoil-go).
+`NewEnclaveHTTPClient` is from [`tinfoil-go`](https://github.com/tinfoilsh/tinfoil-go).
 
 ## Running
 
