@@ -30,7 +30,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/tinfoilsh/tinfoil-go/verifier/client"
+	"github.com/tinfoilsh/tinfoil-go"
 )
 
 type Server struct {
@@ -124,12 +124,11 @@ func (s *Server) handleRing(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// THE TRUST DECISION. SecureClient performs remote attestation: it
-	// verifies that req.Host is a genuine enclave running the exact code
+	// THE TRUST DECISION. NewEnclaveHTTPClient performs remote attestation:
+	// it verifies that req.Host is a genuine enclave running the exact code
 	// published by the ENCLAVE_REPO GitHub repo, and returns an HTTP client
 	// whose TLS channel terminates inside that attested enclave.
-	sc := client.NewSecureClient(req.Host, s.enclaveRepo)
-	httpClient, err := sc.HTTPClient()
+	httpClient, err := tinfoil.NewEnclaveHTTPClient(r.Context(), req.Host, tinfoil.Pin{Repo: s.enclaveRepo}, nil)
 	if err != nil {
 		log.Printf("/ring: attestation FAILED for %s (expected %s): %v", req.Host, s.enclaveRepo, err)
 		http.Error(w, "enclave attestation failed: "+err.Error(), http.StatusBadGateway)
